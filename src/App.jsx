@@ -1,8 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
+import Auth from './Auth';
 import { MapContainer, TileLayer, Marker, Popup, useMapEvents, useMap } from 'react-leaflet';
 import L from 'leaflet';
-import { Car, Clock, MapPin, PlusCircle, Users, CheckCircle, Navigation, Loader2 } from 'lucide-react';
+import { 
+  Car, 
+  Clock, 
+  MapPin, 
+  PlusCircle, 
+  Users, 
+  CheckCircle, 
+  Navigation, 
+  Loader2, 
+  LogOut 
+} from 'lucide-react';
 
 // Fix default Leaflet icon assets in Vite
 delete L.Icon.Default.prototype._getIconUrl;
@@ -12,7 +23,7 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
 });
 
-// Helper function: Convert GPS Lat/Lng into real street address using Nominatim OpenStreetMap API
+// Convert GPS Lat/Lng into real street address using OpenStreetMap Nominatim API
 async function reverseGeocode(lat, lng) {
   try {
     const response = await fetch(
@@ -20,7 +31,6 @@ async function reverseGeocode(lat, lng) {
     );
     const data = await response.json();
     if (data && data.display_name) {
-      // Pick address short parts (road, neighborhood, suburb, or city)
       const addr = data.address;
       const shortName = [
         addr.amenity || addr.building || addr.road || addr.pedestrian,
@@ -36,7 +46,7 @@ async function reverseGeocode(lat, lng) {
   return `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
 }
 
-// Helper component: Smoothly pans map to new coordinates
+// Helper: Smoothly pans map to target coordinates
 function MapFlyTo({ center }) {
   const map = useMap();
   useEffect(() => {
@@ -47,7 +57,7 @@ function MapFlyTo({ center }) {
   return null;
 }
 
-// Helper component: Captures map clicks and reverse geocodes to real addresses
+// Helper: Captures map clicks and reverse geocodes to real addresses
 function MapClickHandler({ activeSelection, setPickupCoords, setDestinationCoords, setPickup, setDestination, setIsGeocoding }) {
   useMapEvents({
     async click(e) {
@@ -70,13 +80,14 @@ function MapClickHandler({ activeSelection, setPickupCoords, setDestinationCoord
 }
 
 export default function App() {
+  const [session, setSession] = useState(null);
   const [rides, setRides] = useState([]);
   const [pickup, setPickup] = useState('');
   const [destination, setDestination] = useState('');
   const [seats, setSeats] = useState(2);
   const [loading, setLoading] = useState(true);
 
-  // Map & Geolocation States
+  // Map & Location States
   const [pickupCoords, setPickupCoords] = useState(null);
   const [destinationCoords, setDestinationCoords] = useState(null);
   const [userLocation, setUserLocation] = useState(null);
@@ -84,31 +95,47 @@ export default function App() {
   const [geoLoading, setGeoLoading] = useState(false);
   const [isGeocoding, setIsGeocoding] = useState(false);
 
-  const defaultCenter = [12.9716, 77.5946]; // Default map center
+  const defaultCenter = [12.9716, 77.5946];
 
-  // Track claimed rides locally
+  // Track claimed rides in localStorage
   const [claimedRideIds, setClaimedRideIds] = useState(() => {
     const saved = localStorage.getItem('claimed_rides');
     return saved ? JSON.parse(saved) : [];
   });
 
+  // Track user session state
   useEffect(() => {
-    fetchRides();
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+    });
 
-    const channel = supabase
-      .channel('public:flash_carpool_rides')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'flash_carpool_rides' }, (payload) => {
-        setRides((prev) => [payload.new, ...prev]);
-      })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'flash_carpool_rides' }, (payload) => {
-        setRides((prev) => prev.map((ride) => (ride.id === payload.new.id ? payload.new : ride)));
-      })
-      .subscribe();
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    return () => subscription.unsubscribe();
   }, []);
+
+  // Fetch rides & subscribe to Real-Time updates when session is active
+  useEffect(() => {
+    if (session) {
+      fetchRides();
+
+      const channel = supabase
+        .channel('public:flash_carpool_rides')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'flash_carpool_rides' }, (payload) => {
+          setRides((prev) => [payload.new, ...prev]);
+        })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'flash_carpool_rides' }, (payload) => {
+          setRides((prev) => prev.map((ride) => (ride.id === payload.new.id ? payload.new : ride)));
+        })
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(channel);
+      };
+    }
+  }, [session]);
 
   useEffect(() => {
     localStorage.setItem('claimed_rides', JSON.stringify(claimedRideIds));
@@ -125,7 +152,7 @@ export default function App() {
     setLoading(false);
   };
 
-  // Geolocation Handler with Real Address Lookup
+  // Handle Geolocation API
   const handleUseMyLocation = () => {
     if (!navigator.geolocation) {
       alert('Geolocation is not supported by your browser.');
@@ -159,7 +186,8 @@ export default function App() {
     e.preventDefault();
 
     const newRide = {
-      driver_name: 'Alex (You)',
+      driver_name: session.user.email.split('@')[0],
+      user_id: session.user.id,
       pickup_location: pickup,
       destination: destination,
       seats_available: Number(seats),
@@ -189,21 +217,40 @@ export default function App() {
 
     if (!error) {
       setClaimedRideIds((prev) => [...prev, rideId]);
+    } else {
+      alert('Failed to claim seat: ' + error.message);
     }
   };
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+  };
+
+  // Guard: Render Auth Login/Registration view if no active session
+  if (!session) {
+    return <Auth />;
+  }
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 p-4 md:p-8 font-sans">
       <div className="max-w-5xl mx-auto space-y-6">
         
-        {/* Header */}
-        <header className="flex items-center justify-between pb-4 border-b border-slate-800">
+        {/* Header with Logged-in User Email & Log Out Button */}
+        <header className="flex flex-wrap items-center justify-between pb-4 border-b border-slate-800 gap-4">
           <h1 className="text-2xl font-bold text-emerald-400 flex items-center gap-2">
             <Car className="w-7 h-7" /> FlashCommute
           </h1>
-          <span className="text-xs bg-emerald-500/20 text-emerald-300 px-3 py-1 rounded-full font-medium animate-pulse">
-            Real Address Mode
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-slate-400 bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700">
+              {session.user.email}
+            </span>
+            <button
+              onClick={handleSignOut}
+              className="text-xs bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-3.5 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5"
+            >
+              <LogOut className="w-3.5 h-3.5" /> Sign Out
+            </button>
+          </div>
         </header>
 
         {/* Map & Controls Section */}
@@ -246,7 +293,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="h-64 rounded-xl overflow-hidden border border-slate-700 relative">
+          <div className="h-64 rounded-xl overflow-hidden border border-slate-700">
             <MapContainer center={defaultCenter} zoom={13} style={{ height: '100%', width: '100%' }}>
               <TileLayer
                 attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -275,7 +322,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Dashboard Grid */}
+        {/* Responsive Dashboard Grid */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-start">
           
           {/* Post Ride Form */}
@@ -353,7 +400,7 @@ export default function App() {
                             <Users className="w-3.5 h-3.5" /> {!isFull ? `${ride.seats_available} seats left` : 'Full'}
                           </span>
                           <span className="flex items-center gap-1.5">
-                            <Clock className="w-3.5 h-3.5" /> Leaving in {ride.departure_time}
+                            <Clock className="w-3.5 h-3.5" /> Driver: {ride.driver_name || 'Driver'}
                           </span>
                         </div>
                       </div>
